@@ -1,0 +1,25 @@
+{
+  "name": "wintercircus-previewer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "bridge": "node bridge/server.mjs",
+    "dev:all": "concurrently -k \"npm run bridge\" \"npm run dev\"",
+    "bridge:ffmpeg": "node bridge/ffmpeg-pipe.mjs",
+    "bridge:syphon": "zsh native/syphon/run-adapter.sh --ws ws://localhost:8787/ingest",
+    "bridge:ndi": "zsh native/ndi/run-adapter.sh --ws ws://localhost:8787/ingest",
+    "bridge:spout": "pwsh -File native/spout/SpoutAdapter.ps1 -WsUrl ws://localhost:8787/ingest"
+  },
+  "dependencies": {
+    "three": "^0.180.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "vite": "^7.1.12"
+  }
+}

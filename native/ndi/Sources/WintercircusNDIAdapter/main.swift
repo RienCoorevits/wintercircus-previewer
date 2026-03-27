@@ -1,0 +1,364 @@
+import CNDI
+import CoreGraphics
+import CoreImage
+import Foundation
+import ImageIO
+import UniformTypeIdentifiers
+
+struct Arguments {
+  let wsUrl: URL
+  let source: String?
+  let fps: Double
+  let width: Int
+  let quality: Double
+}
+
+func parseArguments() -> Arguments {
+  let arguments = Array(CommandLine.arguments.dropFirst())
+  var wsUrl = URL(string: "ws://localhost:8787/ingest")!
+  var source: String?
+  var fps = 30.0
+  var width = 4096
+  var quality = 0.86
+
+  var index = 0
+  while index < arguments.count {
+    let argument = arguments[index]
+    if argument == "--ws", index + 1 < arguments.count, let url = URL(string: arguments[index + 1]) {
+      wsUrl = url
+      index += 2
+      continue
+    }
+
+    if argument == "--source", index + 1 < arguments.count {
+      source = arguments[index + 1]
+      index += 2
+      continue
+    }
+
+    if argument == "--fps", index + 1 < arguments.count, let value = Double(arguments[index + 1]) {
+      fps = max(value, 1)
+      index += 2
+      continue
+    }
+
+    if argument == "--width", index + 1 < arguments.count, let value = Int(arguments[index + 1]) {
+      width = max(value, 256)
+      index += 2
+      continue
+    }
+
+    if argument == "--quality", index + 1 < arguments.count, let value = Double(arguments[index + 1]) {
+      quality = min(max(value, 0.1), 1.0)
+      index += 2
+      continue
+    }
+
+    index += 1
+  }
+
+  return Arguments(
+    wsUrl: wsUrl,
+    source: source?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+    fps: fps,
+    width: width,
+    quality: quality
+  )
+}
+
+extension String {
+  var nilIfEmpty: String? {
+    isEmpty ? nil : self
+  }
+}
+
+final class Logger {
+  static func info(_ message: String) {
+    fputs("\(message)\n", stderr)
+  }
+}
+
+final class WebSocketSender: NSObject, URLSessionWebSocketDelegate {
+  private let task: URLSessionWebSocketTask
+  private let session: URLSession
+
+  init(url: URL) {
+    let configuration = URLSessionConfiguration.default
+    configuration.timeoutIntervalForRequest = 10
+    self.session = URLSession(configuration: configuration)
+    self.task = session.webSocketTask(with: url)
+    super.init()
+    task.resume()
+  }
+
+  deinit {
+    task.cancel(with: .normalClosure, reason: nil)
+    session.invalidateAndCancel()
+  }
+
+  func sendMeta(label: String) {
+    let payload = #"{"type":"meta","label":"\#(label.replacingOccurrences(of: "\"", with: "\\\""))"}"#
+    task.send(.string(payload)) { error in
+      if let error {
+        Logger.info("WebSocket meta send failed: \(error.localizedDescription)")
+      }
+    }
+  }
+
+  func sendFrame(_ data: Data) {
+    task.send(.data(data)) { error in
+      if let error {
+        Logger.info("WebSocket frame send failed: \(error.localizedDescription)")
+      }
+    }
+  }
+}
+
+final class NDIBridgeAdapter {
+  private let arguments: Arguments
+  private let sender: WebSocketSender
+  private let ciContext = CIContext()
+  private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+  private let finder: NDIlib_find_instance_t?
+  private var receiver: NDIlib_recv_instance_t?
+  private var lastSendTime = CFAbsoluteTimeGetCurrent()
+
+  init(arguments: Arguments) throws {
+    self.arguments = arguments
+    self.sender = WebSocketSender(url: arguments.wsUrl)
+
+    guard NDIlib_initialize() else {
+      throw NSError(domain: "WintercircusNDIAdapter", code: 10, userInfo: [
+        NSLocalizedDescriptionKey: "NDIlib_initialize() failed.",
+      ])
+    }
+
+    var findSettings = NDIlib_find_create_t()
+    findSettings.show_local_sources = true
+    findSettings.p_groups = nil
+    findSettings.p_extra_ips = nil
+    self.finder = NDIlib_find_create_v2(&findSettings)
+
+    if finder == nil {
+      throw NSError(domain: "WintercircusNDIAdapter", code: 11, userInfo: [
+        NSLocalizedDescriptionKey: "Could not create NDI finder instance.",
+      ])
+    }
+  }
+
+  deinit {
+    if let receiver {
+      NDIlib_recv_destroy(receiver)
+    }
+    if let finder {
+      NDIlib_find_destroy(finder)
+    }
+    NDIlib_destroy()
+  }
+
+  func run() {
+    sender.sendMeta(label: "NDI adapter started.")
+    Logger.info("NDI adapter started.")
+    Logger.info("Bridge: \(arguments.wsUrl.absoluteString)")
+    if let source = arguments.source {
+      Logger.info("Requested NDI source: \(source)")
+    }
+
+    while true {
+      if receiver == nil {
+        connectToSourceIfAvailable()
+      }
+
+      guard let receiver else {
+        if let finder {
+          _ = NDIlib_find_wait_for_sources(finder, 1000)
+        } else {
+          Thread.sleep(forTimeInterval: 1.0)
+        }
+        continue
+      }
+
+      var videoFrame = NDIlib_video_frame_v2_t()
+      let frameType = NDIlib_recv_capture_v2(receiver, &videoFrame, nil, nil, 1000)
+
+      switch frameType {
+      case NDIlib_frame_type_video:
+        handleVideoFrame(videoFrame, receiver: receiver)
+      case NDIlib_frame_type_status_change:
+        updateReceiverStatus(receiver)
+      case NDIlib_frame_type_source_change:
+        updateReceiverStatus(receiver)
+      case NDIlib_frame_type_error:
+        Logger.info("NDI receiver reported an error; reconnecting.")
+        NDIlib_recv_destroy(receiver)
+        self.receiver = nil
+      default:
+        break
+      }
+    }
+  }
+
+  private func connectToSourceIfAvailable() {
+    guard let finder else {
+      return
+    }
+
+    var numberOfSources: UInt32 = 0
+    guard let sourcePointer = NDIlib_find_get_current_sources(finder, &numberOfSources) else {
+      sender.sendMeta(label: "NDI: waiting for sources")
+      return
+    }
+
+    let sources = UnsafeBufferPointer(start: sourcePointer, count: Int(numberOfSources))
+    guard let selectedSource = selectSource(from: sources) else {
+      sender.sendMeta(label: arguments.source == nil ? "NDI: waiting for any source" : "NDI: waiting for \(arguments.source!)")
+      return
+    }
+
+    var recvSettings = NDIlib_recv_create_v3_t()
+    recvSettings.source_to_connect_to = selectedSource
+    recvSettings.color_format = NDIlib_recv_color_format_BGRX_BGRA
+    recvSettings.bandwidth = NDIlib_recv_bandwidth_highest
+    recvSettings.allow_video_fields = false
+    let receiver = "Wintercircus Previewer".withCString { receiverName in
+      recvSettings.p_ndi_recv_name = receiverName
+      return NDIlib_recv_create_v3(&recvSettings)
+    }
+
+    guard let receiver else {
+      Logger.info("Failed to create NDI receiver.")
+      return
+    }
+
+    self.receiver = receiver
+    sender.sendMeta(label: "NDI: \(sourceLabel(from: selectedSource))")
+    Logger.info("Connected to NDI source: \(sourceLabel(from: selectedSource))")
+  }
+
+  private func selectSource(from sources: UnsafeBufferPointer<NDIlib_source_t>) -> NDIlib_source_t? {
+    if let target = arguments.source?.lowercased() {
+      return sources.first { source in
+        let name = source.p_ndi_name.flatMap { String(cString: $0) }?.lowercased() ?? ""
+        return name == target || name.contains(target)
+      }
+    }
+
+    return sources.first
+  }
+
+  private func sourceLabel(from source: NDIlib_source_t) -> String {
+    source.p_ndi_name.flatMap { String(cString: $0) } ?? "Unnamed NDI Source"
+  }
+
+  private func updateReceiverStatus(_ receiver: NDIlib_recv_instance_t) {
+    var sourceNamePointer: UnsafePointer<CChar>?
+    let didChange = NDIlib_recv_get_source_name(receiver, &sourceNamePointer, 0)
+    if didChange, let sourceNamePointer {
+      let name = String(cString: sourceNamePointer)
+      sender.sendMeta(label: "NDI: \(name)")
+      NDIlib_recv_free_string(receiver, sourceNamePointer)
+    }
+  }
+
+  private func handleVideoFrame(_ videoFrame: NDIlib_video_frame_v2_t, receiver: NDIlib_recv_instance_t) {
+    defer {
+      var mutableFrame = videoFrame
+      NDIlib_recv_free_video_v2(receiver, &mutableFrame)
+    }
+
+    let now = CFAbsoluteTimeGetCurrent()
+    if now - lastSendTime < (1.0 / arguments.fps) {
+      return
+    }
+    lastSendTime = now
+
+    guard let jpegData = makeJPEGData(from: videoFrame) else {
+      return
+    }
+
+    sender.sendFrame(jpegData)
+  }
+
+  private func makeJPEGData(from videoFrame: NDIlib_video_frame_v2_t) -> Data? {
+    guard let framePointer = videoFrame.p_data else {
+      return nil
+    }
+
+    let stride = max(videoFrame.line_stride_in_bytes, videoFrame.xres * 4)
+    let dataSize = stride * videoFrame.yres
+    let copiedData = Data(bytes: framePointer, count: Int(dataSize))
+    let colorFormat = videoFrame.FourCC
+
+    let alphaInfo: CGImageAlphaInfo
+    if colorFormat == NDIlib_FourCC_video_type_BGRA {
+      alphaInfo = .premultipliedFirst
+    } else {
+      alphaInfo = .noneSkipFirst
+    }
+
+    guard let provider = CGDataProvider(data: copiedData as CFData) else {
+      return nil
+    }
+
+    let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(CGBitmapInfo(rawValue: alphaInfo.rawValue))
+    guard let cgImage = CGImage(
+      width: Int(videoFrame.xres),
+      height: Int(videoFrame.yres),
+      bitsPerComponent: 8,
+      bitsPerPixel: 32,
+      bytesPerRow: Int(stride),
+      space: colorSpace,
+      bitmapInfo: bitmapInfo,
+      provider: provider,
+      decode: nil,
+      shouldInterpolate: false,
+      intent: .defaultIntent
+    ) else {
+      return nil
+    }
+
+    var image = CIImage(cgImage: cgImage)
+    if videoFrame.xres > arguments.width {
+      let scale = CGFloat(arguments.width) / CGFloat(videoFrame.xres)
+      image = image.applyingFilter("CILanczosScaleTransform", parameters: [
+        "inputScale": scale,
+        "inputAspectRatio": 1.0,
+      ])
+    }
+
+    guard let encodedCGImage = ciContext.createCGImage(image, from: image.extent) else {
+      return nil
+    }
+
+    let outputData = NSMutableData()
+    guard
+      let destination = CGImageDestinationCreateWithData(
+        outputData,
+        UTType.jpeg.identifier as CFString,
+        1,
+        nil
+      )
+    else {
+      return nil
+    }
+
+    CGImageDestinationAddImage(destination, encodedCGImage, [
+      kCGImageDestinationLossyCompressionQuality: arguments.quality,
+    ] as CFDictionary)
+
+    guard CGImageDestinationFinalize(destination) else {
+      return nil
+    }
+
+    return outputData as Data
+  }
+}
+
+let arguments = parseArguments()
+
+do {
+  try NDIBridgeAdapter(arguments: arguments).run()
+} catch {
+  Logger.info("NDI adapter failed: \(error.localizedDescription)")
+  exit(1)
+}

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Wintercircus VR Previewer</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <div class="viewport">
+        <canvas id="scene"></canvas>
+      </div>
+
+      <button
+        id="toggleHud"
+        class="hud-toggle"
+        type="button"
+        aria-controls="hud"
+        aria-expanded="true"
+      >
+        UI
+      </button>
+
+      <aside class="hud" id="hud">
+        <div class="hud__section">
+          <div class="field">
+            <label class="label" for="sourceMode">Source</label>
+            <select id="sourceMode">
+              <option value="demo">Demo test pattern</option>
+              <option value="file">Local video file</option>
+              <option value="screen">Screen capture</option>
+              <option value="camera">Camera</option>
+              <option value="syphon">Syphon</option>
+              <option value="ndi">NDI</option>
+              <option value="spout">Spout</option>
+              <option value="bridge">Raw WebSocket bridge</option>
+            </select>
+          </div>
+
+          <div class="field" id="fileField">
+            <label class="label" for="fileInput">Video File</label>
+            <input id="fileInput" type="file" accept="video/*" />
+          </div>
+
+          <div class="field is-hidden" id="protocolField">
+            <label class="label" for="protocolTarget">Source Name</label>
+            <input id="protocolTarget" type="text" placeholder="Optional sender/server name" />
+          </div>
+
+          <button id="activateSource">Apply Source</button>
+          <p id="sourceStatus" class="status">Idle.</p>
+        </div>
+
+        <div class="hud__section">
+          <div class="field">
+            <label class="label" for="diameterMeters">Diameter (m)</label>
+            <input id="diameterMeters" type="number" min="0.1" step="0.01" value="20.00" />
+          </div>
+
+          <div class="field">
+            <label class="label" for="heightMeters">Height (m)</label>
+            <input id="heightMeters" type="number" min="0.1" step="0.01" value="5.06" />
+          </div>
+
+          <div class="field field--inline">
+            <label class="label" for="coverageValue">Derived Coverage</label>
+            <p id="coverageValue" class="value">360.0°</p>
+          </div>
+        </div>
+
+        <div class="hud__section">
+          <p class="label">Monitor</p>
+          <canvas id="monitor" width="640" height="52"></canvas>
+        </div>
+      </aside>
+    </div>
+
+    <video id="videoSource" playsinline muted crossorigin="anonymous"></video>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

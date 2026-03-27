@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.DS_Store
+
+native/ndi/.build/
+native/syphon/.build/
+native/syphon/build/
