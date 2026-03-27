@@ -119,6 +119,19 @@ select {
   justify-content: space-between;
 }
 
+.info-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.35rem 0.7rem;
+  align-items: baseline;
+}
+
+.info-grid__label {
+  margin: 0;
+  color: var(--accent);
+  font-size: 0.68rem;
+}
+
 .value,
 .status {
   margin: 0;

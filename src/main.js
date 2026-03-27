@@ -30,6 +30,10 @@ const sourceStatus = document.querySelector("#sourceStatus");
 const diameterInput = document.querySelector("#diameterMeters");
 const heightInput = document.querySelector("#heightMeters");
 const coverageValue = document.querySelector("#coverageValue");
+const projectionResolution = document.querySelector("#projectionResolution");
+const previewResolution = document.querySelector("#previewResolution");
+const sourceResolution = document.querySelector("#sourceResolution");
+const webappFramerate = document.querySelector("#webappFramerate");
 
 const renderer = new THREE.WebGLRenderer({
   canvas,
@@ -199,6 +203,65 @@ let managedSourceItemsByMode = {
   syphon: [],
   ndi: [],
 };
+let lastRenderTime = null;
+let smoothedFps = null;
+
+function formatResolution(width, height) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return "Waiting.";
+  }
+
+  return `${Math.round(width)} x ${Math.round(height)}`;
+}
+
+function formatFps(value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "Waiting.";
+  }
+
+  return `${value.toFixed(1)} fps`;
+}
+
+function updateWebappFramerate(now) {
+  if (lastRenderTime !== null) {
+    const deltaSeconds = (now - lastRenderTime) / 1000;
+    if (deltaSeconds > 0) {
+      const instantaneousFps = 1 / deltaSeconds;
+      smoothedFps =
+        smoothedFps === null
+          ? instantaneousFps
+          : smoothedFps * 0.9 + instantaneousFps * 0.1;
+    }
+  }
+
+  lastRenderTime = now;
+  webappFramerate.textContent = formatFps(smoothedFps);
+}
+
+function updateResolutionInfo() {
+  projectionResolution.textContent = formatResolution(PROJECTION_WIDTH, PROJECTION_HEIGHT);
+  previewResolution.textContent = formatResolution(PREVIEW_WIDTH, PREVIEW_HEIGHT);
+
+  if (sourceState.mode === "video") {
+    sourceResolution.textContent = formatResolution(videoElement.videoWidth, videoElement.videoHeight);
+    return;
+  }
+
+  if (sourceState.mode === "bridge") {
+    sourceResolution.textContent = formatResolution(
+      bridgeImageBitmap?.width ?? 0,
+      bridgeImageBitmap?.height ?? 0,
+    );
+    return;
+  }
+
+  if (sourceState.mode === "demo") {
+    sourceResolution.textContent = `${formatResolution(PREVIEW_WIDTH, PREVIEW_HEIGHT)} generated`;
+    return;
+  }
+
+  sourceResolution.textContent = "Waiting.";
+}
 
 function setStatus(message) {
   sourceStatus.textContent = message;
@@ -780,6 +843,8 @@ function drawMonitor() {
 }
 
 function renderFrame(now) {
+  updateWebappFramerate(now);
+
   if (sourceState.mode === "demo") {
     drawDemo(now);
   } else if (sourceState.mode === "video") {
@@ -788,6 +853,7 @@ function renderFrame(now) {
     drawBridgeSource();
   }
 
+  updateResolutionInfo();
   drawMonitor();
   projectionTexture.needsUpdate = true;
   renderer.render(scene, camera);
@@ -851,6 +917,7 @@ window.addEventListener("resize", () => {
 syncCylinderInputs({ normalize: true });
 syncSourceFields();
 renderProtocolTargetOptions(sourceModeSelect.value);
+updateResolutionInfo();
 setHudOpen(true);
 activateDemoSource();
 renderer.setAnimationLoop(renderFrame);
