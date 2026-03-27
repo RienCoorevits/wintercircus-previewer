@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENDOR_DIR="$ROOT_DIR/vendor/Syphon-Framework"
 BUILD_DIR="$ROOT_DIR/build"
 
-if [[ ! -d "$VENDOR_DIR/.git" ]]; then
+if [[ ! -d "$VENDOR_DIR" ]]; then
   git clone https://github.com/Syphon/Syphon-Framework.git "$VENDOR_DIR"
 fi
 

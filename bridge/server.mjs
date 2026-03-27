@@ -1,7 +1,11 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { WebSocketServer } from "ws";
-import { listManagedSources, resolveManagedLaunch } from "./managed-sources.mjs";
+import {
+  listManagedSources,
+  resolveManagedLaunch,
+  resolveManagedSourceList,
+} from "./managed-sources.mjs";
 
 const PORT = Number(process.env.BRIDGE_PORT || 8787);
 const viewers = new Set();
@@ -20,6 +24,70 @@ let managedSource = {
   log: [],
 };
 let managedProcess = null;
+
+function listManagedSourceItems(protocol) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const spec = resolveManagedSourceList(protocol);
+    const child = spawn(spec.command, spec.args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    const finish = (handler) => (value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      handler(value);
+    };
+
+    const resolveOnce = finish(resolve);
+    const rejectOnce = finish(reject);
+
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      rejectOnce(new Error(`${spec.descriptor.label} source listing timed out.`));
+    }, 30000);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", (error) => {
+      rejectOnce(error);
+    });
+
+    child.on("exit", (code) => {
+      if (code !== 0) {
+        rejectOnce(
+          new Error(
+            stderr.trim() || `${spec.descriptor.label} source listing exited with code ${code ?? "null"}.`,
+          ),
+        );
+        return;
+      }
+
+      try {
+        const payload = JSON.parse(stdout.trim() || "{\"items\":[]}");
+        resolveOnce(Array.isArray(payload.items) ? payload.items : []);
+      } catch (error) {
+        rejectOnce(
+          new Error(
+            `Could not parse ${spec.descriptor.label} source list.${stderr ? ` ${stderr.trim()}` : ""}`,
+          ),
+        );
+      }
+    });
+  });
+}
 
 function pushManagedLog(line) {
   managedSource.log.push(line);
@@ -197,6 +265,25 @@ const server = http.createServer((request, response) => {
       items: listManagedSources(),
       managedSource,
     });
+    return;
+  }
+
+  const sourceItemsMatch = url.pathname.match(/^\/sources\/([^/]+)\/items$/);
+  if (request.method === "GET" && sourceItemsMatch) {
+    const protocol = sourceItemsMatch[1];
+
+    listManagedSourceItems(protocol)
+      .then((items) => {
+        sendJson(response, 200, {
+          protocol,
+          items,
+        });
+      })
+      .catch((error) => {
+        sendJson(response, 400, {
+          error: error instanceof Error ? error.message : "Could not list sources.",
+        });
+      });
     return;
   }
 

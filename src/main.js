@@ -19,7 +19,11 @@ const toggleHudButton = document.querySelector("#toggleHud");
 const fileInput = document.querySelector("#fileInput");
 const fileField = document.querySelector("#fileField");
 const protocolField = document.querySelector("#protocolField");
+const protocolCustomField = document.querySelector("#protocolCustomField");
 const protocolTargetInput = document.querySelector("#protocolTarget");
+const protocolTargetSelect = document.querySelector("#protocolTargetSelect");
+const protocolTargetMeta = document.querySelector("#protocolTargetMeta");
+const refreshProtocolSourcesButton = document.querySelector("#refreshProtocolSources");
 const activateSourceButton = document.querySelector("#activateSource");
 const sourceModeSelect = document.querySelector("#sourceMode");
 const sourceStatus = document.querySelector("#sourceStatus");
@@ -45,7 +49,9 @@ const PREVIEW_WIDTH = Math.min(
 const PREVIEW_HEIGHT = Math.round(PREVIEW_WIDTH / PROJECTION_ASPECT);
 const PREVIEW_LABEL = `${PREVIEW_WIDTH}x${PREVIEW_HEIGHT}`;
 const MANAGED_SOURCE_MODES = new Set(["syphon", "ndi", "spout"]);
+const PICKER_SOURCE_MODES = new Set(["syphon", "ndi"]);
 const BRIDGE_PORT = 8787;
+const CUSTOM_SOURCE_VALUE = "__custom__";
 
 document.body.appendChild(VRButton.createButton(renderer));
 
@@ -189,6 +195,10 @@ let sourceState = {
   mode: "demo",
   info: `Demo test pattern is active. Preview texture ${PREVIEW_LABEL}.`,
 };
+let managedSourceItemsByMode = {
+  syphon: [],
+  ndi: [],
+};
 
 function setStatus(message) {
   sourceStatus.textContent = message;
@@ -196,6 +206,35 @@ function setStatus(message) {
 
 function isManagedSourceMode(mode) {
   return MANAGED_SOURCE_MODES.has(mode);
+}
+
+function supportsSourcePicker(mode) {
+  return PICKER_SOURCE_MODES.has(mode);
+}
+
+function getManagedSourceItem(mode, target) {
+  const items = managedSourceItemsByMode[mode] || [];
+  return items.find((item) => item.target === target) || null;
+}
+
+function formatManagedSourceMeta(mode, item) {
+  if (!supportsSourcePicker(mode)) {
+    return "Enter a source name manually for this protocol.";
+  }
+
+  if (protocolTargetSelect.value === CUSTOM_SOURCE_VALUE) {
+    return "Custom source name override.";
+  }
+
+  if (!item) {
+    return "Automatic source selection.";
+  }
+
+  const ownerFieldLabel = mode === "ndi" ? "Host" : "App";
+  const ownerLabel = item.appName ? `${ownerFieldLabel}: ${item.appName}` : null;
+  const sourceLabel = item.sourceName ? `Source: ${item.sourceName}` : null;
+  const statusLabel = `Status: ${item.isLive ? "live" : "unknown"}`;
+  return [ownerLabel, sourceLabel, statusLabel].filter(Boolean).join(" | ");
 }
 
 function getBridgeHost() {
@@ -222,6 +261,27 @@ async function stopManagedSource() {
   }
 }
 
+async function fetchManagedSourceItems(mode, { preserveSelection = true } = {}) {
+  if (!supportsSourcePicker(mode)) {
+    return;
+  }
+
+  const previousValue = preserveSelection ? protocolTargetSelect.value : "";
+  const response = await fetch(`${getBridgeControlBaseUrl()}/sources/${mode}/items`);
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(payload.error || `Could not list ${mode.toUpperCase()} sources.`);
+  }
+
+  managedSourceItemsByMode = {
+    ...managedSourceItemsByMode,
+    [mode]: Array.isArray(payload.items) ? payload.items : [],
+  };
+  renderProtocolTargetOptions(mode, previousValue);
+  syncProtocolCustomField();
+}
+
 function setHudOpen(nextState) {
   isHudOpen = nextState;
   hud.classList.toggle("hud--collapsed", !isHudOpen);
@@ -229,11 +289,79 @@ function setHudOpen(nextState) {
   toggleHudButton.setAttribute("aria-expanded", String(isHudOpen));
 }
 
+function renderProtocolTargetOptions(mode, preferredValue = protocolTargetSelect.value) {
+  const items = managedSourceItemsByMode[mode] || [];
+  const options = [
+    {
+      value: "",
+      label: "Automatic (first available)",
+    },
+    ...items.map((item) => ({
+      value: item.target,
+      label: item.label,
+    })),
+  ];
+
+  if (supportsSourcePicker(mode)) {
+    options.push({
+      value: CUSTOM_SOURCE_VALUE,
+      label: "Custom...",
+    });
+  }
+
+  protocolTargetSelect.replaceChildren(
+    ...options.map((option) => {
+      const element = document.createElement("option");
+      element.value = option.value;
+      element.textContent = option.label;
+      return element;
+    }),
+  );
+
+  const hasPreferredValue = options.some((option) => option.value === preferredValue);
+  protocolTargetSelect.value = hasPreferredValue ? preferredValue : "";
+  updateProtocolMeta();
+}
+
+function syncProtocolCustomField() {
+  const mode = sourceModeSelect.value;
+  const shouldShowCustomField =
+    isManagedSourceMode(mode) &&
+    (!supportsSourcePicker(mode) || protocolTargetSelect.value === CUSTOM_SOURCE_VALUE);
+  protocolCustomField.classList.toggle("is-hidden", !shouldShowCustomField);
+  updateProtocolMeta();
+}
+
+function updateProtocolMeta() {
+  const mode = sourceModeSelect.value;
+  const item = getManagedSourceItem(mode, protocolTargetSelect.value);
+  protocolTargetMeta.textContent = formatManagedSourceMeta(mode, item);
+}
+
 function syncSourceFields() {
   const mode = sourceModeSelect.value;
   const isManagedMode = isManagedSourceMode(mode);
+  const usesSourcePicker = supportsSourcePicker(mode);
   fileField.classList.toggle("is-hidden", mode !== "file");
   protocolField.classList.toggle("is-hidden", !isManagedMode);
+  refreshProtocolSourcesButton.classList.toggle("is-hidden", !usesSourcePicker);
+  protocolTargetSelect.disabled = !usesSourcePicker;
+  if (!usesSourcePicker) {
+    renderProtocolTargetOptions(mode);
+  }
+  syncProtocolCustomField();
+}
+
+function getSelectedManagedTarget() {
+  if (!supportsSourcePicker(sourceModeSelect.value)) {
+    return protocolTargetInput.value.trim();
+  }
+
+  if (protocolTargetSelect.value === CUSTOM_SOURCE_VALUE) {
+    return protocolTargetInput.value.trim();
+  }
+
+  return protocolTargetSelect.value.trim();
 }
 
 function formatCoverage(value) {
@@ -520,7 +648,7 @@ async function activateManagedSource(mode) {
     },
     body: JSON.stringify({
       protocol: mode,
-      target: protocolTargetInput.value.trim(),
+      target: getSelectedManagedTarget(),
     }),
   });
 
@@ -561,6 +689,31 @@ async function activateSelectedSource() {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Source activation failed.";
     setStatus(message);
+  }
+}
+
+async function refreshManagedSourcesForCurrentMode({ preserveSelection = true } = {}) {
+  const mode = sourceModeSelect.value;
+  if (!supportsSourcePicker(mode)) {
+    return;
+  }
+
+  try {
+    setStatus(`Refreshing ${mode.toUpperCase()} sources...`);
+    await fetchManagedSourceItems(mode, { preserveSelection });
+    const items = managedSourceItemsByMode[mode] || [];
+    setStatus(
+      items.length > 0
+        ? `${mode.toUpperCase()} sources ready: ${items.length} found.`
+        : `${mode.toUpperCase()} sources ready: none found yet.`,
+    );
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : `Could not refresh ${mode.toUpperCase()} sources.`;
+    setStatus(message);
+    renderProtocolTargetOptions(mode, CUSTOM_SOURCE_VALUE);
+    protocolTargetSelect.value = CUSTOM_SOURCE_VALUE;
+    syncProtocolCustomField();
   }
 }
 
@@ -644,7 +797,16 @@ activateSourceButton.addEventListener("click", activateSelectedSource);
 toggleHudButton.addEventListener("click", () => {
   setHudOpen(!isHudOpen);
 });
-sourceModeSelect.addEventListener("change", syncSourceFields);
+sourceModeSelect.addEventListener("change", () => {
+  syncSourceFields();
+  void refreshManagedSourcesForCurrentMode();
+});
+protocolTargetSelect.addEventListener("change", () => {
+  syncProtocolCustomField();
+});
+refreshProtocolSourcesButton.addEventListener("click", () => {
+  void refreshManagedSourcesForCurrentMode();
+});
 diameterInput.addEventListener("input", () => {
   syncCylinderInputs();
 });
@@ -688,6 +850,7 @@ window.addEventListener("resize", () => {
 
 syncCylinderInputs({ normalize: true });
 syncSourceFields();
+renderProtocolTargetOptions(sourceModeSelect.value);
 setHudOpen(true);
 activateDemoSource();
 renderer.setAnimationLoop(renderFrame);

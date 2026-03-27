@@ -12,6 +12,20 @@ struct Arguments {
   let fps: Double
   let width: Int
   let quality: Double
+  let listSources: Bool
+}
+
+struct SourceItem: Codable {
+  let target: String
+  let label: String
+  let protocolName: String
+  let sourceName: String?
+  let appName: String?
+  let isLive: Bool
+}
+
+struct SourceListPayload: Codable {
+  let items: [SourceItem]
 }
 
 func parseArguments() -> Arguments {
@@ -21,6 +35,7 @@ func parseArguments() -> Arguments {
   var fps = 30.0
   var width = 4096
   var quality = 0.86
+  var listSources = false
 
   var index = 0
   while index < arguments.count {
@@ -55,6 +70,12 @@ func parseArguments() -> Arguments {
       continue
     }
 
+    if argument == "--list-sources" {
+      listSources = true
+      index += 1
+      continue
+    }
+
     index += 1
   }
 
@@ -63,7 +84,8 @@ func parseArguments() -> Arguments {
     source: source?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
     fps: fps,
     width: width,
-    quality: quality
+    quality: quality,
+    listSources: listSources
   )
 }
 
@@ -77,6 +99,12 @@ final class Logger {
   static func info(_ message: String) {
     fputs("\(message)\n", stderr)
   }
+}
+
+func writeSourceList(_ items: [SourceItem]) throws {
+  let encoder = JSONEncoder()
+  let data = try encoder.encode(SourceListPayload(items: items))
+  FileHandle.standardOutput.write(data)
 }
 
 final class WebSocketSender: NSObject, URLSessionWebSocketDelegate {
@@ -211,7 +239,8 @@ final class SyphonBridgeAdapter {
         let name = (description[SyphonServerDescriptionNameKey] as? String ?? "").lowercased()
         let app = (description[SyphonServerDescriptionAppNameKey] as? String ?? "").lowercased()
         let combined = "\(app) \(name)"
-        return name == target || app == target || combined.contains(target)
+        let labeled = "\(app) / \(name)"
+        return name == target || app == target || combined.contains(target) || labeled == target
       }
     }
 
@@ -265,6 +294,9 @@ final class SyphonBridgeAdapter {
       ])
     }
 
+    let background = CIImage(color: .black).cropped(to: image.extent)
+    image = image.composited(over: background)
+
     guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
       Logger.info("Could not render CGImage from Syphon frame.")
       return nil
@@ -299,6 +331,24 @@ final class SyphonBridgeAdapter {
 let arguments = parseArguments()
 
 do {
+  if arguments.listSources {
+    let items = SyphonServerDirectory.shared().servers.compactMap { description -> SourceItem? in
+      let name = description[SyphonServerDescriptionNameKey] as? String ?? "Unnamed"
+      let app = description[SyphonServerDescriptionAppNameKey] as? String ?? "Unknown App"
+      let label = "\(app) / \(name)"
+      return SourceItem(
+        target: label,
+        label: "\(label) [live]",
+        protocolName: "syphon",
+        sourceName: name,
+        appName: app,
+        isLive: true
+      )
+    }
+    try writeSourceList(items)
+    exit(0)
+  }
+
   try SyphonBridgeAdapter(arguments: arguments).run()
 } catch {
   Logger.info("Syphon adapter failed: \(error.localizedDescription)")

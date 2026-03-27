@@ -98,6 +98,21 @@ select {
   margin-top: 0.6rem;
 }
 
+.field-row {
+  display: flex;
+  gap: 0.45rem;
+}
+
+.field-row > *:first-child {
+  flex: 1 1 auto;
+}
+
+.field-row > button {
+  width: auto;
+  flex: 0 0 auto;
+  min-width: 5.5rem;
+}
+
 .field--inline {
   display: flex;
   align-items: center;
@@ -169,6 +184,11 @@ button {
   border: 1px solid #272727;
   background: #0a0a0a;
   line-height: 1.45;
+}
+
+.status--compact {
+  min-height: 0;
+  margin-top: 0.45rem;
 }
 
 @media (max-width: 900px) {

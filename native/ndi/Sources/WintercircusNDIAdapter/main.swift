@@ -11,6 +11,20 @@ struct Arguments {
   let fps: Double
   let width: Int
   let quality: Double
+  let listSources: Bool
+}
+
+struct SourceItem: Codable {
+  let target: String
+  let label: String
+  let protocolName: String
+  let sourceName: String?
+  let appName: String?
+  let isLive: Bool
+}
+
+struct SourceListPayload: Codable {
+  let items: [SourceItem]
 }
 
 func parseArguments() -> Arguments {
@@ -20,6 +34,7 @@ func parseArguments() -> Arguments {
   var fps = 30.0
   var width = 4096
   var quality = 0.86
+  var listSources = false
 
   var index = 0
   while index < arguments.count {
@@ -54,6 +69,12 @@ func parseArguments() -> Arguments {
       continue
     }
 
+    if argument == "--list-sources" {
+      listSources = true
+      index += 1
+      continue
+    }
+
     index += 1
   }
 
@@ -62,7 +83,8 @@ func parseArguments() -> Arguments {
     source: source?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
     fps: fps,
     width: width,
-    quality: quality
+    quality: quality,
+    listSources: listSources
   )
 }
 
@@ -76,6 +98,84 @@ final class Logger {
   static func info(_ message: String) {
     fputs("\(message)\n", stderr)
   }
+}
+
+func writeSourceList(_ items: [SourceItem]) throws {
+  let encoder = JSONEncoder()
+  let data = try encoder.encode(SourceListPayload(items: items))
+  FileHandle.standardOutput.write(data)
+}
+
+func parseNDISourceName(_ rawName: String) -> (appName: String?, sourceName: String?) {
+  let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+  guard
+    let openParenIndex = trimmed.lastIndex(of: "("),
+    let closeParenIndex = trimmed.lastIndex(of: ")"),
+    openParenIndex < closeParenIndex
+  else {
+    return (nil, trimmed.nilIfEmpty)
+  }
+
+  let host = trimmed[..<openParenIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+  let source = trimmed[trimmed.index(after: openParenIndex)..<closeParenIndex]
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+  return (host.nilIfEmpty, source.nilIfEmpty)
+}
+
+func listNDISources() throws {
+  guard NDIlib_initialize() else {
+    throw NSError(domain: "WintercircusNDIAdapter", code: 1, userInfo: [
+      NSLocalizedDescriptionKey: "NDIlib_initialize() failed.",
+    ])
+  }
+
+  defer {
+    NDIlib_destroy()
+  }
+
+  var findSettings = NDIlib_find_create_t()
+  findSettings.show_local_sources = true
+  findSettings.p_groups = nil
+  findSettings.p_extra_ips = nil
+
+  guard let finder = NDIlib_find_create_v2(&findSettings) else {
+    throw NSError(domain: "WintercircusNDIAdapter", code: 2, userInfo: [
+      NSLocalizedDescriptionKey: "Could not create NDI finder instance.",
+    ])
+  }
+
+  defer {
+    NDIlib_find_destroy(finder)
+  }
+
+  _ = NDIlib_find_wait_for_sources(finder, 1500)
+
+  var numberOfSources: UInt32 = 0
+  guard let sourcePointer = NDIlib_find_get_current_sources(finder, &numberOfSources) else {
+    try writeSourceList([])
+    return
+  }
+
+  let items = UnsafeBufferPointer(start: sourcePointer, count: Int(numberOfSources)).map { source in
+    let name = source.p_ndi_name.flatMap { String(cString: $0) } ?? "Unnamed NDI Source"
+    let parsed = parseNDISourceName(name)
+    let label: String
+    if let appName = parsed.appName, let sourceName = parsed.sourceName {
+      label = "\(appName) / \(sourceName) [live]"
+    } else {
+      label = "\(name) [live]"
+    }
+    return SourceItem(
+      target: name,
+      label: label,
+      protocolName: "ndi",
+      sourceName: parsed.sourceName ?? name,
+      appName: parsed.appName,
+      isLive: true
+    )
+  }
+
+  try writeSourceList(items)
 }
 
 final class WebSocketSender: NSObject, URLSessionWebSocketDelegate {
@@ -326,6 +426,9 @@ final class NDIBridgeAdapter {
       ])
     }
 
+    let background = CIImage(color: .black).cropped(to: image.extent)
+    image = image.composited(over: background)
+
     guard let encodedCGImage = ciContext.createCGImage(image, from: image.extent) else {
       return nil
     }
@@ -357,6 +460,11 @@ final class NDIBridgeAdapter {
 let arguments = parseArguments()
 
 do {
+  if arguments.listSources {
+    try listNDISources()
+    exit(0)
+  }
+
   try NDIBridgeAdapter(arguments: arguments).run()
 } catch {
   Logger.info("NDI adapter failed: \(error.localizedDescription)")

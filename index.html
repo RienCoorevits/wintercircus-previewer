@@ -43,7 +43,18 @@
           </div>
 
           <div class="field is-hidden" id="protocolField">
-            <label class="label" for="protocolTarget">Source Name</label>
+            <label class="label" for="protocolTargetSelect">Source</label>
+            <div class="field-row">
+              <select id="protocolTargetSelect">
+                <option value="">Automatic (first available)</option>
+              </select>
+              <button id="refreshProtocolSources" type="button">Refresh</button>
+            </div>
+            <p id="protocolTargetMeta" class="status status--compact">Automatic source selection.</p>
+          </div>
+
+          <div class="field is-hidden" id="protocolCustomField">
+            <label class="label" for="protocolTarget">Custom Source Name</label>
             <input id="protocolTarget" type="text" placeholder="Optional sender/server name" />
           </div>
 

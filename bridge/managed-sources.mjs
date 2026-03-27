@@ -104,3 +104,39 @@ export function resolveManagedLaunch(protocol, { ingestUrl, target }) {
 
   throw new Error(`No launch strategy defined for ${protocol}.`);
 }
+
+export function resolveManagedSourceList(protocol) {
+  const descriptor = listManagedSources().find((source) => source.protocol === protocol);
+
+  if (!descriptor) {
+    throw new Error(`Unknown managed source protocol: ${protocol}`);
+  }
+
+  if (!descriptor.supported) {
+    throw new Error(descriptor.reason || `${descriptor.label} is not available here.`);
+  }
+
+  if (protocol === "syphon") {
+    return {
+      descriptor,
+      command: "zsh",
+      args: [
+        path.join(ROOT_DIR, "native", "syphon", "run-adapter.sh"),
+        "--list-sources",
+      ],
+    };
+  }
+
+  if (protocol === "ndi") {
+    return {
+      descriptor,
+      command: "zsh",
+      args: [
+        path.join(ROOT_DIR, "native", "ndi", "run-adapter.sh"),
+        "--list-sources",
+      ],
+    };
+  }
+
+  throw new Error(`Source listing is not available for ${descriptor.label}.`);
+}

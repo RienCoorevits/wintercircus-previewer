@@ -81,6 +81,8 @@ npm run bridge:ffmpeg -- --label "NDI Feed" -- -f libndi_newtek -i "Your NDI Sou
 
 The app now exposes `Syphon`, `NDI`, and `Spout` directly in the source dropdown.
 
+For `Syphon` and `NDI`, the UI now queries the local bridge for currently discoverable sources and presents them in a picker before launch. You can still fall back to a custom source name if needed.
+
 When you click `Apply Source`, the browser sends a launch request to the local bridge:
 
 - `POST http://localhost:8787/control/launch`
