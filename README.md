@@ -41,6 +41,34 @@ npm run dev:all
 
 Then open the local Vite URL shown in the terminal.
 
+## Quest 3 over Wi-Fi
+
+For Quest Browser testing without `adb`, use the HTTPS Quest mode:
+
+```bash
+npm install
+npm run quest:all
+```
+
+That does three things:
+
+1. starts the local frame bridge on port `8787`
+2. builds the app for production
+3. serves the built app over HTTPS on `0.0.0.0:5173` and proxies `/bridge/*` to the local bridge, including WebSocket traffic
+
+The Quest launcher prints both of these URLs:
+
+- `https://localhost:5173`
+- `https://<your-mac-lan-ip>:5173`
+
+Open the LAN URL in Quest Browser while the headset is on the same network as your Mac.
+
+Notes:
+
+- The HTTPS certificate is a generated local development certificate stored in `.cert/`
+- Quest Browser will likely show a self-signed certificate warning the first time; continue past that warning
+- In Quest mode, the browser talks to the bridge through the same Vite origin, so `Syphon` and `NDI` can still stay local to the Mac
+
 ## Immediate workflows
 
 ### Desktop preview

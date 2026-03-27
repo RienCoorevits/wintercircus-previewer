@@ -5,3 +5,4 @@ dist/
 native/ndi/.build/
 native/syphon/.build/
 native/syphon/build/
+.cert/

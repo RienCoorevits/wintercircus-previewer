@@ -55,6 +55,7 @@ const PREVIEW_LABEL = `${PREVIEW_WIDTH}x${PREVIEW_HEIGHT}`;
 const MANAGED_SOURCE_MODES = new Set(["syphon", "ndi", "spout"]);
 const PICKER_SOURCE_MODES = new Set(["syphon", "ndi"]);
 const BRIDGE_PORT = 8787;
+const BRIDGE_PROXY_PATH = "/bridge";
 const CUSTOM_SOURCE_VALUE = "__custom__";
 
 document.body.appendChild(VRButton.createButton(renderer));
@@ -304,12 +305,23 @@ function getBridgeHost() {
   return window.location.hostname || "localhost";
 }
 
+function shouldUseBridgeProxy() {
+  return import.meta.env.DEV || window.location.protocol === "https:";
+}
+
 function getBridgeFrameUrl() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  if (shouldUseBridgeProxy()) {
+    return `${protocol}//${window.location.host}${BRIDGE_PROXY_PATH}/frames`;
+  }
   return `${protocol}//${getBridgeHost()}:${BRIDGE_PORT}/frames`;
 }
 
 function getBridgeControlBaseUrl() {
+  if (shouldUseBridgeProxy()) {
+    return `${window.location.origin}${BRIDGE_PROXY_PATH}`;
+  }
+
   const protocol = window.location.protocol === "https:" ? "https:" : "http:";
   return `${protocol}//${getBridgeHost()}:${BRIDGE_PORT}`;
 }

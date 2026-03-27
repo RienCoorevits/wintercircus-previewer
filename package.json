@@ -5,10 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "quest:cert": "node scripts/dev-cert.mjs",
+    "quest:dev": "node scripts/run-quest-dev.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "bridge": "node bridge/server.mjs",
     "dev:all": "concurrently -k \"npm run bridge\" \"npm run dev\"",
+    "quest:all": "concurrently -k \"npm run bridge\" \"npm run quest:dev\"",
     "bridge:ffmpeg": "node bridge/ffmpeg-pipe.mjs",
     "bridge:syphon": "zsh native/syphon/run-adapter.sh --ws ws://localhost:8787/ingest",
     "bridge:ndi": "zsh native/ndi/run-adapter.sh --ws ws://localhost:8787/ingest",
