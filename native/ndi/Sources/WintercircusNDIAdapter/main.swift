@@ -5,6 +5,10 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
+let bridgePacketMagic = Data("WCP1".utf8)
+let bridgePacketKindVideo: UInt8 = 1
+let bridgePacketKindAudio: UInt8 = 2
+
 struct Arguments {
   let wsUrl: URL
   let source: String?
@@ -91,6 +95,15 @@ func parseArguments() -> Arguments {
 extension String {
   var nilIfEmpty: String? {
     isEmpty ? nil : self
+  }
+}
+
+extension Data {
+  mutating func appendInteger<T: FixedWidthInteger>(_ value: T) {
+    var littleEndianValue = value.littleEndian
+    Swift.withUnsafeBytes(of: &littleEndianValue) { rawBuffer in
+      append(contentsOf: rawBuffer)
+    }
   }
 }
 
@@ -279,11 +292,14 @@ final class NDIBridgeAdapter {
       }
 
       var videoFrame = NDIlib_video_frame_v2_t()
-      let frameType = NDIlib_recv_capture_v2(receiver, &videoFrame, nil, nil, 1000)
+      var audioFrame = NDIlib_audio_frame_v2_t()
+      let frameType = NDIlib_recv_capture_v2(receiver, &videoFrame, &audioFrame, nil, 1000)
 
       switch frameType {
       case NDIlib_frame_type_video:
         handleVideoFrame(videoFrame, receiver: receiver)
+      case NDIlib_frame_type_audio:
+        handleAudioFrame(audioFrame, receiver: receiver)
       case NDIlib_frame_type_status_change:
         updateReceiverStatus(receiver)
       case NDIlib_frame_type_source_change:
@@ -376,7 +392,24 @@ final class NDIBridgeAdapter {
       return
     }
 
-    sender.sendFrame(jpegData)
+    sender.sendFrame(makeBridgePacket(
+      kind: bridgePacketKindVideo,
+      timestamp: bridgeTimestamp(timestamp: videoFrame.timestamp, timecode: videoFrame.timecode),
+      payload: jpegData
+    ))
+  }
+
+  private func handleAudioFrame(_ audioFrame: NDIlib_audio_frame_v2_t, receiver: NDIlib_recv_instance_t) {
+    defer {
+      var mutableFrame = audioFrame
+      NDIlib_recv_free_audio_v2(receiver, &mutableFrame)
+    }
+
+    guard let packet = makeAudioPacket(from: audioFrame) else {
+      return
+    }
+
+    sender.sendFrame(packet)
   }
 
   private func makeJPEGData(from videoFrame: NDIlib_video_frame_v2_t) -> Data? {
@@ -454,6 +487,75 @@ final class NDIBridgeAdapter {
     }
 
     return outputData as Data
+  }
+
+  private func makeAudioPacket(from audioFrame: NDIlib_audio_frame_v2_t) -> Data? {
+    guard
+      let framePointer = audioFrame.p_data,
+      audioFrame.sample_rate > 0,
+      audioFrame.no_channels > 0,
+      audioFrame.no_samples > 0
+    else {
+      return nil
+    }
+
+    let channelCount = Int(audioFrame.no_channels)
+    let sampleCount = Int(audioFrame.no_samples)
+    let strideInFloats: Int
+    if audioFrame.channel_stride_in_bytes > 0 {
+      strideInFloats = Int(audioFrame.channel_stride_in_bytes) / MemoryLayout<Float>.size
+    } else {
+      strideInFloats = sampleCount
+    }
+
+    var interleavedSamples = Data(count: channelCount * sampleCount * MemoryLayout<Float>.size)
+    interleavedSamples.withUnsafeMutableBytes { rawBuffer in
+      guard let destination = rawBuffer.bindMemory(to: Float.self).baseAddress else {
+        return
+      }
+
+      for sampleIndex in 0..<sampleCount {
+        for channelIndex in 0..<channelCount {
+          let channelBase = framePointer.advanced(by: channelIndex * strideInFloats)
+          destination[sampleIndex * channelCount + channelIndex] = channelBase[sampleIndex]
+        }
+      }
+    }
+
+    var header = Data()
+    header.appendInteger(UInt32(audioFrame.sample_rate))
+    header.appendInteger(UInt16(channelCount))
+    header.appendInteger(UInt32(sampleCount))
+    header.append(0)
+
+    return makeBridgePacket(
+      kind: bridgePacketKindAudio,
+      timestamp: bridgeTimestamp(timestamp: audioFrame.timestamp, timecode: audioFrame.timecode),
+      header: header,
+      payload: interleavedSamples
+    )
+  }
+
+  private func bridgeTimestamp(timestamp: Int64, timecode: Int64) -> Int64? {
+    if timestamp != NDIlib_recv_timestamp_undefined {
+      return timestamp
+    }
+
+    if timecode != NDIlib_send_timecode_synthesize {
+      return timecode
+    }
+
+    return nil
+  }
+
+  private func makeBridgePacket(kind: UInt8, timestamp: Int64?, header: Data = Data(), payload: Data) -> Data {
+    var packet = Data()
+    packet.append(bridgePacketMagic)
+    packet.appendInteger(kind)
+    packet.appendInteger(timestamp ?? -1)
+    packet.append(header)
+    packet.append(payload)
+    return packet
   }
 }
 

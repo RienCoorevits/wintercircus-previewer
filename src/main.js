@@ -65,6 +65,15 @@ const PICKER_SOURCE_MODES = new Set(["syphon", "ndi"]);
 const BRIDGE_PORT = 8787;
 const BRIDGE_PROXY_PATH = "/bridge";
 const CUSTOM_SOURCE_VALUE = "__custom__";
+const BRIDGE_PACKET_MAGIC = "WCP1";
+const BRIDGE_PACKET_KIND_VIDEO = 1;
+const BRIDGE_PACKET_KIND_AUDIO = 2;
+const BRIDGE_PACKET_HEADER_BYTES = 13;
+const BRIDGE_AUDIO_HEADER_BYTES = 24;
+const BRIDGE_AV_BUFFER_SECONDS = 0.2;
+const BRIDGE_AUDIO_RESET_GAP_SECONDS = 0.75;
+const BRIDGE_UNDEFINED_TIMESTAMP = 9223372036854775807n;
+const BRIDGE_AUDIO_RESYNC_TOLERANCE_SECONDS = 0.08;
 
 document.body.appendChild(VRButton.createButton(renderer));
 
@@ -278,6 +287,16 @@ let cylinderMesh = null;
 let activeStream = null;
 let bridgeSocket = null;
 let bridgeImageBitmap = null;
+let bridgeVideoQueue = [];
+let bridgeAudioContext = null;
+let bridgeAudioWorkletLoaded = false;
+let bridgeAudioWorkletNode = null;
+let bridgeAudioChannelCount = 0;
+let bridgeAudioGainNode = null;
+let bridgeTimelineBaseTimestamp = null;
+let bridgeTimelineBaseClock = null;
+let bridgeTimelineClockMode = null;
+let bridgeAudioBufferedUntilTimestampSeconds = null;
 let isHudOpen = true;
 let cylinderDiameterMeters = Number(diameterInput.value) || BASE_RADIUS * 2;
 let cylinderHeightMeters = Number(heightInput.value) || BASE_SCREEN_HEIGHT;
@@ -828,10 +847,40 @@ function stopActiveStream() {
   }
 }
 
-function disconnectBridge() {
+function disconnectBridge({ closeAudioContext = true } = {}) {
   if (bridgeSocket) {
     bridgeSocket.close();
     bridgeSocket = null;
+  }
+
+  if (bridgeImageBitmap) {
+    bridgeImageBitmap.close();
+    bridgeImageBitmap = null;
+  }
+
+  bridgeVideoQueue.forEach((frame) => {
+    frame.bitmap.close();
+  });
+  bridgeVideoQueue = [];
+  bridgeTimelineBaseTimestamp = null;
+  bridgeTimelineBaseClock = null;
+  bridgeTimelineClockMode = null;
+  bridgeAudioBufferedUntilTimestampSeconds = null;
+
+  if (bridgeAudioWorkletNode) {
+    bridgeAudioWorkletNode.port.postMessage({ type: "reset" });
+  }
+
+  if (closeAudioContext && bridgeAudioContext) {
+    if (bridgeAudioWorkletNode) {
+      bridgeAudioWorkletNode.disconnect();
+      bridgeAudioWorkletNode = null;
+    }
+    void bridgeAudioContext.close();
+    bridgeAudioContext = null;
+    bridgeAudioWorkletLoaded = false;
+    bridgeAudioChannelCount = 0;
+    bridgeAudioGainNode = null;
   }
 }
 
@@ -927,6 +976,155 @@ function activateDemoSource() {
   setStatus(sourceState.info);
 }
 
+async function ensureBridgeAudioContext() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    return null;
+  }
+
+  if (!bridgeAudioContext) {
+    bridgeAudioContext = new AudioContextClass({
+      latencyHint: "interactive",
+      sampleRate: 48000,
+    });
+    bridgeAudioGainNode = bridgeAudioContext.createGain();
+    bridgeAudioGainNode.gain.value = 1;
+    bridgeAudioGainNode.connect(bridgeAudioContext.destination);
+  }
+
+  if (!bridgeAudioWorkletLoaded) {
+    if (!bridgeAudioContext.audioWorklet) {
+      throw new Error("AudioWorklet is not supported in this browser.");
+    }
+    await bridgeAudioContext.audioWorklet.addModule(new URL("./bridge-audio-worklet.js", import.meta.url));
+    bridgeAudioWorkletLoaded = true;
+  }
+
+  if (bridgeAudioContext.state === "suspended") {
+    try {
+      await bridgeAudioContext.resume();
+    } catch {
+      // Leave the context suspended; audio packets will be ignored until resumed.
+    }
+  }
+
+  return bridgeAudioContext;
+}
+
+function ensureBridgeAudioWorkletNode(channelCount) {
+  if (!bridgeAudioContext || !bridgeAudioGainNode || !bridgeAudioWorkletLoaded) {
+    return null;
+  }
+
+  const normalizedChannelCount = THREE.MathUtils.clamp(channelCount, 1, 8);
+  if (bridgeAudioWorkletNode && bridgeAudioChannelCount === normalizedChannelCount) {
+    return bridgeAudioWorkletNode;
+  }
+
+  if (bridgeAudioWorkletNode) {
+    bridgeAudioWorkletNode.disconnect();
+    bridgeAudioWorkletNode = null;
+  }
+
+  bridgeAudioWorkletNode = new AudioWorkletNode(bridgeAudioContext, "bridge-audio-processor", {
+    numberOfInputs: 0,
+    numberOfOutputs: 1,
+    outputChannelCount: [normalizedChannelCount],
+    channelCount: normalizedChannelCount,
+    channelCountMode: "explicit",
+    channelInterpretation: "speakers",
+  });
+  bridgeAudioWorkletNode.connect(bridgeAudioGainNode);
+  bridgeAudioWorkletNode.port.postMessage({
+    type: "configure",
+    channelCount: normalizedChannelCount,
+    prebufferSeconds: BRIDGE_AV_BUFFER_SECONDS,
+  });
+  bridgeAudioChannelCount = normalizedChannelCount;
+  return bridgeAudioWorkletNode;
+}
+
+function getBridgeClockNow(mode = bridgeTimelineClockMode) {
+  if (mode === "audio" && bridgeAudioContext) {
+    return bridgeAudioContext.currentTime;
+  }
+
+  return performance.now() / 1000;
+}
+
+function resetBridgeTimeline(timestampSeconds, mode) {
+  bridgeTimelineBaseTimestamp = timestampSeconds;
+  bridgeTimelineClockMode = mode;
+  bridgeTimelineBaseClock = getBridgeClockNow(mode) + BRIDGE_AV_BUFFER_SECONDS;
+}
+
+function ensureBridgeTimeline(timestampSeconds, preferredMode) {
+  if (timestampSeconds === null) {
+    return;
+  }
+
+  if (
+    bridgeTimelineBaseTimestamp === null ||
+    bridgeTimelineBaseClock === null ||
+    bridgeTimelineClockMode !== preferredMode
+  ) {
+    resetBridgeTimeline(timestampSeconds, preferredMode);
+  }
+}
+
+function parseBridgeTimestamp(dataView) {
+  if (typeof dataView.getBigInt64 !== "function") {
+    return null;
+  }
+
+  const rawTimestamp = dataView.getBigInt64(5, true);
+  if (rawTimestamp < 0 || rawTimestamp === BRIDGE_UNDEFINED_TIMESTAMP) {
+    return null;
+  }
+
+  return Number(rawTimestamp) / 1e7;
+}
+
+function deinterleaveBridgeAudio(samplePayload, channelCount, sampleFrames) {
+  const channels = Array.from(
+    { length: channelCount },
+    () => new Float32Array(sampleFrames),
+  );
+
+  for (let sampleIndex = 0; sampleIndex < sampleFrames; sampleIndex += 1) {
+    for (let channelIndex = 0; channelIndex < channelCount; channelIndex += 1) {
+      channels[channelIndex][sampleIndex] =
+        samplePayload[sampleIndex * channelCount + channelIndex];
+    }
+  }
+
+  return channels;
+}
+
+function resampleAudioChannel(channelData, inputSampleRate, outputSampleRate) {
+  if (inputSampleRate === outputSampleRate) {
+    return channelData;
+  }
+
+  const outputLength = Math.max(
+    1,
+    Math.round((channelData.length * outputSampleRate) / inputSampleRate),
+  );
+  const output = new Float32Array(outputLength);
+  const ratio = inputSampleRate / outputSampleRate;
+
+  for (let index = 0; index < outputLength; index += 1) {
+    const position = index * ratio;
+    const leftIndex = Math.floor(position);
+    const rightIndex = Math.min(leftIndex + 1, channelData.length - 1);
+    const mix = position - leftIndex;
+    output[index] =
+      channelData[leftIndex] * (1 - mix) + channelData[rightIndex] * mix;
+  }
+
+  return output;
+}
+
 function handleBridgeFrame(data) {
   const blob = new Blob([data], { type: "image/jpeg" });
   createImageBitmap(blob).then((bitmap) => {
@@ -937,10 +1135,158 @@ function handleBridgeFrame(data) {
   });
 }
 
+function enqueueBridgeVideoFrame(imageData, timestampSeconds) {
+  const blob = new Blob([imageData], { type: "image/jpeg" });
+  createImageBitmap(blob).then((bitmap) => {
+    if (timestampSeconds === null) {
+      if (bridgeImageBitmap) {
+        bridgeImageBitmap.close();
+      }
+      bridgeImageBitmap = bitmap;
+      return;
+    }
+
+    ensureBridgeTimeline(timestampSeconds, bridgeAudioContext ? "audio" : "performance");
+    bridgeVideoQueue.push({ bitmap, timestampSeconds });
+    bridgeVideoQueue.sort((left, right) => left.timestampSeconds - right.timestampSeconds);
+  });
+}
+
+function flushBridgeVideoQueue() {
+  if (bridgeVideoQueue.length === 0) {
+    return;
+  }
+
+  if (
+    bridgeTimelineBaseTimestamp === null ||
+    bridgeTimelineBaseClock === null ||
+    bridgeTimelineClockMode === null
+  ) {
+    const latestFrame = bridgeVideoQueue.pop();
+    bridgeVideoQueue.forEach((frame) => frame.bitmap.close());
+    bridgeVideoQueue = [];
+    if (latestFrame) {
+      if (bridgeImageBitmap) {
+        bridgeImageBitmap.close();
+      }
+      bridgeImageBitmap = latestFrame.bitmap;
+    }
+    return;
+  }
+
+  const mediaTime =
+    bridgeTimelineBaseTimestamp + (getBridgeClockNow(bridgeTimelineClockMode) - bridgeTimelineBaseClock);
+  let lastReadyIndex = -1;
+  for (let index = 0; index < bridgeVideoQueue.length; index += 1) {
+    if (bridgeVideoQueue[index].timestampSeconds <= mediaTime + 0.01) {
+      lastReadyIndex = index;
+    } else {
+      break;
+    }
+  }
+
+  if (lastReadyIndex < 0) {
+    return;
+  }
+
+  const readyFrames = bridgeVideoQueue.splice(0, lastReadyIndex + 1);
+  const nextFrame = readyFrames.pop();
+  readyFrames.forEach((frame) => frame.bitmap.close());
+
+  if (nextFrame) {
+    if (bridgeImageBitmap) {
+      bridgeImageBitmap.close();
+    }
+    bridgeImageBitmap = nextFrame.bitmap;
+  }
+}
+
+async function handleBridgeAudioPacket(dataView) {
+  if (!bridgeAudioContext || !bridgeAudioGainNode) {
+    return;
+  }
+
+  const timestampSeconds = parseBridgeTimestamp(dataView);
+  const sampleRate = dataView.getUint32(13, true);
+  const channelCount = dataView.getUint16(17, true);
+  const sampleFrames = dataView.getUint32(19, true);
+  if (sampleRate <= 0 || channelCount <= 0 || sampleFrames <= 0) {
+    return;
+  }
+
+  const workletNode = ensureBridgeAudioWorkletNode(channelCount);
+  if (!workletNode) {
+    return;
+  }
+
+  const samplePayload = new Float32Array(
+    dataView.buffer,
+    dataView.byteOffset + BRIDGE_AUDIO_HEADER_BYTES,
+    sampleFrames * channelCount,
+  );
+  const sourceChannels = deinterleaveBridgeAudio(samplePayload, channelCount, sampleFrames);
+  const processedChannels = sourceChannels.map((channelData) =>
+    resampleAudioChannel(channelData, sampleRate, bridgeAudioContext.sampleRate),
+  );
+  const processedFrameCount = processedChannels[0]?.length ?? 0;
+  if (processedFrameCount <= 0) {
+    return;
+  }
+
+  if (timestampSeconds !== null) {
+    const shouldResetTimeline =
+      bridgeTimelineBaseTimestamp === null ||
+      bridgeTimelineBaseClock === null ||
+      bridgeTimelineClockMode !== "audio" ||
+      bridgeAudioBufferedUntilTimestampSeconds === null ||
+      timestampSeconds < bridgeAudioBufferedUntilTimestampSeconds - BRIDGE_AUDIO_RESYNC_TOLERANCE_SECONDS ||
+      timestampSeconds - bridgeAudioBufferedUntilTimestampSeconds > BRIDGE_AUDIO_RESET_GAP_SECONDS;
+
+    if (shouldResetTimeline) {
+      resetBridgeTimeline(timestampSeconds, "audio");
+      bridgeAudioBufferedUntilTimestampSeconds = timestampSeconds;
+      workletNode.port.postMessage({ type: "reset" });
+    }
+
+    bridgeAudioBufferedUntilTimestampSeconds = Math.max(
+      bridgeAudioBufferedUntilTimestampSeconds ?? timestampSeconds,
+      timestampSeconds + processedFrameCount / bridgeAudioContext.sampleRate,
+    );
+  }
+
+  workletNode.port.postMessage(
+    {
+      type: "enqueue",
+      channelCount,
+      frameCount: processedFrameCount,
+      channels: processedChannels.map((channelData) => channelData.buffer),
+    },
+    processedChannels.map((channelData) => channelData.buffer),
+  );
+}
+
+function parseBridgePacket(buffer) {
+  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < BRIDGE_PACKET_HEADER_BYTES) {
+    return null;
+  }
+
+  const signature = String.fromCharCode(...new Uint8Array(buffer, 0, 4));
+  if (signature !== BRIDGE_PACKET_MAGIC) {
+    return null;
+  }
+
+  const dataView = new DataView(buffer);
+  return {
+    kind: dataView.getUint8(4),
+    dataView,
+    timestampSeconds: parseBridgeTimestamp(dataView),
+  };
+}
+
 function activateBridgeSource() {
   stopActiveStream();
   resetVideoElement();
-  disconnectBridge();
+  disconnectBridge({ closeAudioContext: false });
 
   bridgeSocket = new WebSocket(getBridgeFrameUrl());
   bridgeSocket.binaryType = "arraybuffer";
@@ -966,7 +1312,24 @@ function activateBridgeSource() {
       return;
     }
 
-    handleBridgeFrame(event.data);
+    const packet = parseBridgePacket(event.data);
+    if (!packet) {
+      handleBridgeFrame(event.data);
+      return;
+    }
+
+    if (packet.kind === BRIDGE_PACKET_KIND_VIDEO) {
+      enqueueBridgeVideoFrame(
+        event.data.slice(BRIDGE_PACKET_HEADER_BYTES),
+        packet.timestampSeconds,
+      );
+      return;
+    }
+
+    if (packet.kind === BRIDGE_PACKET_KIND_AUDIO) {
+      handleBridgeAudioPacket(packet.dataView);
+      return;
+    }
   });
 
   bridgeSocket.addEventListener("close", () => {
@@ -983,7 +1346,7 @@ function activateBridgeSource() {
 async function activateManagedSource(mode) {
   stopActiveStream();
   resetVideoElement();
-  disconnectBridge();
+  disconnectBridge({ closeAudioContext: false });
 
   const protocolName = mode.toUpperCase();
   setStatus(`Launching ${protocolName} source...`);
@@ -1010,6 +1373,9 @@ async function activateManagedSource(mode) {
 async function activateSelectedSource() {
   try {
     const mode = sourceModeSelect.value;
+    if (mode === "bridge" || isManagedSourceMode(mode)) {
+      await ensureBridgeAudioContext();
+    }
     if (mode === "demo") {
       activateDemoSource();
       return;
@@ -1115,6 +1481,7 @@ function drawVideoSource() {
 }
 
 function drawBridgeSource() {
+  flushBridgeVideoQueue();
   if (!bridgeImageBitmap) {
     return;
   }
