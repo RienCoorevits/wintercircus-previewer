@@ -32,6 +32,11 @@ const diameterInput = document.querySelector("#diameterMeters");
 const heightInput = document.querySelector("#heightMeters");
 const eyeHeightInput = document.querySelector("#eyeHeightMeters");
 const silhouetteCountInput = document.querySelector("#silhouetteCount");
+const ambientLightIntensityInput = document.querySelector("#ambientLightIntensity");
+const floorSpillIntensityInput = document.querySelector("#floorSpillIntensity");
+const floorSpillBlurInput = document.querySelector("#floorSpillBlur");
+const floorSpillFalloffInput = document.querySelector("#floorSpillFalloff");
+const floorBaseLevelInput = document.querySelector("#floorBaseLevel");
 const coverageValue = document.querySelector("#coverageValue");
 const projectionResolution = document.querySelector("#projectionResolution");
 const previewResolution = document.querySelector("#previewResolution");
@@ -85,13 +90,79 @@ controls.update();
 const ambient = new THREE.AmbientLight("#ffffff", 1.5);
 scene.add(ambient);
 
+const floorSpillUniforms = {
+  projectionMap: { value: null },
+  floorRadius: { value: BASE_RADIUS * 0.78 },
+  coverageRadians: { value: Math.PI * 2 },
+  baseColor: { value: new THREE.Color("#071019") },
+  baseLevel: { value: Number(floorBaseLevelInput.value) || 1 },
+  spillIntensity: { value: Number(floorSpillIntensityInput.value) || 1 },
+  spillBlur: { value: Number(floorSpillBlurInput.value) || 1 },
+  spillFalloff: { value: Number(floorSpillFalloffInput.value) || 0.82 },
+};
+
+const floorMaterial = new THREE.ShaderMaterial({
+  uniforms: floorSpillUniforms,
+  transparent: true,
+  side: THREE.DoubleSide,
+  toneMapped: false,
+  vertexShader: `
+    varying vec3 vWorldPosition;
+
+    void main() {
+      vWorldPosition = (modelMatrix * vec4(position, 1.0)).xyz;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D projectionMap;
+    uniform float floorRadius;
+    uniform float coverageRadians;
+    uniform vec3 baseColor;
+    uniform float baseLevel;
+    uniform float spillIntensity;
+    uniform float spillBlur;
+    uniform float spillFalloff;
+
+    varying vec3 vWorldPosition;
+
+    const float PI = 3.141592653589793;
+
+    vec3 sampleProjection(float u) {
+      float wrappedU = fract(u);
+      return texture2D(projectionMap, vec2(wrappedU, 0.18)).rgb * 0.08 +
+        texture2D(projectionMap, vec2(wrappedU, 0.34)).rgb * 0.12 +
+        texture2D(projectionMap, vec2(wrappedU, 0.54)).rgb * 0.2 +
+        texture2D(projectionMap, vec2(wrappedU, 0.74)).rgb * 0.26 +
+        texture2D(projectionMap, vec2(wrappedU, 0.9)).rgb * 0.34;
+    }
+
+    void main() {
+      vec2 floorPoint = vWorldPosition.xz;
+      float radius = length(floorPoint);
+      float normalizedRadius = clamp(radius / max(floorRadius, 0.0001), 0.0, 1.0);
+      float angleFromNorth = atan(floorPoint.x, -floorPoint.y);
+      float halfCoverage = min(coverageRadians * 0.5, PI);
+      float coverageMask = 1.0 - smoothstep(halfCoverage * 0.97, halfCoverage + 0.05, abs(angleFromNorth));
+      float angleU = angleFromNorth / max(coverageRadians, 0.0001) + 0.5;
+      float blurAmount = mix(0.018, 0.006, normalizedRadius) * spillBlur;
+      vec3 spillColor =
+        sampleProjection(angleU - blurAmount) * 0.24 +
+        sampleProjection(angleU) * 0.52 +
+        sampleProjection(angleU + blurAmount) * 0.24;
+      float luminance = dot(spillColor, vec3(0.2126, 0.7152, 0.0722));
+      float radialFalloff = mix(0.18, 1.0, pow(normalizedRadius, max(spillFalloff, 0.001)));
+      float edgeFade = 1.0 - smoothstep(0.9, 1.0, normalizedRadius);
+      float spillStrength = spillIntensity * coverageMask * radialFalloff * edgeFade * (0.24 + pow(clamp(luminance, 0.0, 1.0), 0.9) * 1.5);
+      vec3 color = baseColor * baseLevel + spillColor * spillStrength;
+      gl_FragColor = vec4(color, 0.92);
+    }
+  `,
+});
+
 const ground = new THREE.Mesh(
   new THREE.CircleGeometry(BASE_RADIUS * 0.78, 96),
-  new THREE.MeshBasicMaterial({
-    color: "#071019",
-    transparent: true,
-    opacity: 0.85,
-  }),
+  floorMaterial,
 );
 ground.rotation.x = -Math.PI / 2;
 ground.position.y = 0.001;
@@ -186,6 +257,7 @@ projectionTexture.minFilter = THREE.LinearFilter;
 projectionTexture.magFilter = THREE.LinearFilter;
 projectionTexture.repeat.x = -1;
 projectionTexture.offset.x = 1;
+floorSpillUniforms.projectionMap.value = projectionTexture;
 
 const cylinderMaterial = new THREE.MeshBasicMaterial({
   map: projectionTexture,
@@ -211,6 +283,11 @@ let cylinderDiameterMeters = Number(diameterInput.value) || BASE_RADIUS * 2;
 let cylinderHeightMeters = Number(heightInput.value) || BASE_SCREEN_HEIGHT;
 let viewerEyeHeightMeters = Number(eyeHeightInput.value) || 1.7;
 let silhouetteCount = Math.max(0, Math.round(Number(silhouetteCountInput.value) || 8));
+let ambientFillIntensity = Number(ambientLightIntensityInput.value) || 1.5;
+let floorSpillIntensity = Number(floorSpillIntensityInput.value) || 1;
+let floorSpillBlur = Number(floorSpillBlurInput.value) || 1;
+let floorSpillFalloff = Number(floorSpillFalloffInput.value) || 0.82;
+let floorBaseLevel = Number(floorBaseLevelInput.value) || 1;
 let sourceState = {
   mode: "demo",
   info: `Demo test pattern is active. Preview texture ${PREVIEW_LABEL}.`,
@@ -586,11 +663,66 @@ function parsePositiveNumber(value) {
   return parsed;
 }
 
+function parseNonNegativeNumber(value) {
+  if (value.trim() === "") {
+    return null;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+
+  return parsed;
+}
+
 function updateCoverageLabel(diameterMeters, heightMeters) {
   const derivedCoverageDegrees =
     (PROJECTION_ASPECT * heightMeters * 360) / (Math.PI * diameterMeters);
   coverageValue.textContent = formatCoverage(derivedCoverageDegrees);
   return derivedCoverageDegrees;
+}
+
+function syncLightingControls({ normalize = false } = {}) {
+  const parsedAmbientFill = parseNonNegativeNumber(ambientLightIntensityInput.value);
+  const parsedSpillIntensity = parseNonNegativeNumber(floorSpillIntensityInput.value);
+  const parsedSpillBlur = parsePositiveNumber(floorSpillBlurInput.value);
+  const parsedSpillFalloff = parsePositiveNumber(floorSpillFalloffInput.value);
+  const parsedFloorBase = parseNonNegativeNumber(floorBaseLevelInput.value);
+
+  if (parsedAmbientFill !== null) {
+    ambientFillIntensity = parsedAmbientFill;
+  }
+
+  if (parsedSpillIntensity !== null) {
+    floorSpillIntensity = parsedSpillIntensity;
+  }
+
+  if (parsedSpillBlur !== null) {
+    floorSpillBlur = parsedSpillBlur;
+  }
+
+  if (parsedSpillFalloff !== null) {
+    floorSpillFalloff = parsedSpillFalloff;
+  }
+
+  if (parsedFloorBase !== null) {
+    floorBaseLevel = parsedFloorBase;
+  }
+
+  ambient.intensity = ambientFillIntensity;
+  floorSpillUniforms.spillIntensity.value = floorSpillIntensity;
+  floorSpillUniforms.spillBlur.value = floorSpillBlur;
+  floorSpillUniforms.spillFalloff.value = floorSpillFalloff;
+  floorSpillUniforms.baseLevel.value = floorBaseLevel;
+
+  if (normalize) {
+    ambientLightIntensityInput.value = ambientFillIntensity.toFixed(2);
+    floorSpillIntensityInput.value = floorSpillIntensity.toFixed(2);
+    floorSpillBlurInput.value = floorSpillBlur.toFixed(2);
+    floorSpillFalloffInput.value = floorSpillFalloff.toFixed(2);
+    floorBaseLevelInput.value = floorBaseLevel.toFixed(2);
+  }
 }
 
 function rebuildCylinder({ normalizeInputs = false } = {}) {
@@ -599,6 +731,7 @@ function rebuildCylinder({ normalizeInputs = false } = {}) {
   const radius = diameterMeters / 2;
   const derivedCoverageDegrees = updateCoverageLabel(diameterMeters, heightMeters);
   const coverageDegrees = THREE.MathUtils.clamp(derivedCoverageDegrees, 1, 360);
+  const floorRadius = radius * 0.78;
 
   if (normalizeInputs) {
     diameterInput.value = diameterMeters.toFixed(2);
@@ -628,6 +761,8 @@ function rebuildCylinder({ normalizeInputs = false } = {}) {
   scene.add(cylinderMesh);
 
   ground.scale.setScalar(radius / BASE_RADIUS);
+  floorSpillUniforms.floorRadius.value = floorRadius;
+  floorSpillUniforms.coverageRadians.value = thetaLength;
   guideRing.scale.setScalar(radius / BASE_RADIUS);
 
   const labelRadius = radius * 0.62;
@@ -1034,6 +1169,21 @@ eyeHeightInput.addEventListener("input", () => {
 silhouetteCountInput.addEventListener("input", () => {
   syncSilhouetteCount();
 });
+ambientLightIntensityInput.addEventListener("input", () => {
+  syncLightingControls();
+});
+floorSpillIntensityInput.addEventListener("input", () => {
+  syncLightingControls();
+});
+floorSpillBlurInput.addEventListener("input", () => {
+  syncLightingControls();
+});
+floorSpillFalloffInput.addEventListener("input", () => {
+  syncLightingControls();
+});
+floorBaseLevelInput.addEventListener("input", () => {
+  syncLightingControls();
+});
 diameterInput.addEventListener("change", () => {
   syncCylinderInputs({ normalize: true });
 });
@@ -1046,6 +1196,21 @@ eyeHeightInput.addEventListener("change", () => {
 silhouetteCountInput.addEventListener("change", () => {
   syncSilhouetteCount({ normalize: true });
 });
+ambientLightIntensityInput.addEventListener("change", () => {
+  syncLightingControls({ normalize: true });
+});
+floorSpillIntensityInput.addEventListener("change", () => {
+  syncLightingControls({ normalize: true });
+});
+floorSpillBlurInput.addEventListener("change", () => {
+  syncLightingControls({ normalize: true });
+});
+floorSpillFalloffInput.addEventListener("change", () => {
+  syncLightingControls({ normalize: true });
+});
+floorBaseLevelInput.addEventListener("change", () => {
+  syncLightingControls({ normalize: true });
+});
 diameterInput.addEventListener("blur", () => {
   syncCylinderInputs({ normalize: true });
 });
@@ -1057,6 +1222,21 @@ eyeHeightInput.addEventListener("blur", () => {
 });
 silhouetteCountInput.addEventListener("blur", () => {
   syncSilhouetteCount({ normalize: true });
+});
+ambientLightIntensityInput.addEventListener("blur", () => {
+  syncLightingControls({ normalize: true });
+});
+floorSpillIntensityInput.addEventListener("blur", () => {
+  syncLightingControls({ normalize: true });
+});
+floorSpillBlurInput.addEventListener("blur", () => {
+  syncLightingControls({ normalize: true });
+});
+floorSpillFalloffInput.addEventListener("blur", () => {
+  syncLightingControls({ normalize: true });
+});
+floorBaseLevelInput.addEventListener("blur", () => {
+  syncLightingControls({ normalize: true });
 });
 window.addEventListener("keydown", (event) => {
   const target = event.target;
@@ -1083,6 +1263,7 @@ window.addEventListener("resize", () => {
 
 updateViewerEyeHeight({ normalizeInput: true });
 syncSilhouetteCount({ normalize: true });
+syncLightingControls({ normalize: true });
 syncCylinderInputs({ normalize: true });
 syncSourceFields();
 renderProtocolTargetOptions(sourceModeSelect.value);
