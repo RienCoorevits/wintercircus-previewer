@@ -9,6 +9,7 @@ const PROJECTION_ASPECT = PROJECTION_WIDTH / PROJECTION_HEIGHT;
 const BASE_SCREEN_HEIGHT = 4;
 const BASE_RADIUS = (PROJECTION_ASPECT * BASE_SCREEN_HEIGHT) / (2 * Math.PI);
 const CARDINAL_LABELS = ["N", "E", "S", "W"];
+const SILHOUETTE_HEIGHTS = [1.6, 1.65, 1.7, 1.75, 1.8];
 
 const canvas = document.querySelector("#scene");
 const monitorCanvas = document.querySelector("#monitor");
@@ -29,6 +30,8 @@ const sourceModeSelect = document.querySelector("#sourceMode");
 const sourceStatus = document.querySelector("#sourceStatus");
 const diameterInput = document.querySelector("#diameterMeters");
 const heightInput = document.querySelector("#heightMeters");
+const eyeHeightInput = document.querySelector("#eyeHeightMeters");
+const silhouetteCountInput = document.querySelector("#silhouetteCount");
 const coverageValue = document.querySelector("#coverageValue");
 const projectionResolution = document.querySelector("#projectionResolution");
 const previewResolution = document.querySelector("#previewResolution");
@@ -189,6 +192,16 @@ const cylinderMaterial = new THREE.MeshBasicMaterial({
   side: THREE.BackSide,
 });
 
+const silhouetteMaterial = new THREE.MeshBasicMaterial({
+  color: "#0a0a0a",
+  side: THREE.DoubleSide,
+  transparent: true,
+  opacity: 0.9,
+});
+
+const silhouettesGroup = new THREE.Group();
+scene.add(silhouettesGroup);
+
 let cylinderMesh = null;
 let activeStream = null;
 let bridgeSocket = null;
@@ -196,6 +209,8 @@ let bridgeImageBitmap = null;
 let isHudOpen = true;
 let cylinderDiameterMeters = Number(diameterInput.value) || BASE_RADIUS * 2;
 let cylinderHeightMeters = Number(heightInput.value) || BASE_SCREEN_HEIGHT;
+let viewerEyeHeightMeters = Number(eyeHeightInput.value) || 1.7;
+let silhouetteCount = Math.max(0, Math.round(Number(silhouetteCountInput.value) || 8));
 let sourceState = {
   mode: "demo",
   info: `Demo test pattern is active. Preview texture ${PREVIEW_LABEL}.`,
@@ -206,6 +221,69 @@ let managedSourceItemsByMode = {
 };
 let lastRenderTime = null;
 let smoothedFps = null;
+
+function createSilhouette(heightMeters) {
+  const silhouette = new THREE.Group();
+  const shoulderWidth = heightMeters * 0.23;
+  const torsoWidth = heightMeters * 0.16;
+  const torsoHeight = heightMeters * 0.52;
+  const legWidth = torsoWidth * 0.42;
+  const legHeight = heightMeters * 0.34;
+  const headRadius = heightMeters * 0.07;
+  const armWidth = torsoWidth * 0.34;
+  const armHeight = torsoHeight * 0.7;
+
+  const torso = new THREE.Mesh(
+    new THREE.PlaneGeometry(torsoWidth, torsoHeight),
+    silhouetteMaterial,
+  );
+  torso.position.y = legHeight + torsoHeight / 2;
+  silhouette.add(torso);
+
+  const head = new THREE.Mesh(
+    new THREE.CircleGeometry(headRadius, 24),
+    silhouetteMaterial,
+  );
+  head.position.y = legHeight + torsoHeight + headRadius * 1.5;
+  silhouette.add(head);
+
+  const leftLeg = new THREE.Mesh(
+    new THREE.PlaneGeometry(legWidth, legHeight),
+    silhouetteMaterial,
+  );
+  leftLeg.position.set(-legWidth * 0.65, legHeight / 2, 0);
+  silhouette.add(leftLeg);
+
+  const rightLeg = new THREE.Mesh(
+    new THREE.PlaneGeometry(legWidth, legHeight),
+    silhouetteMaterial,
+  );
+  rightLeg.position.set(legWidth * 0.65, legHeight / 2, 0);
+  silhouette.add(rightLeg);
+
+  const shoulderBar = new THREE.Mesh(
+    new THREE.PlaneGeometry(shoulderWidth, torsoHeight * 0.16),
+    silhouetteMaterial,
+  );
+  shoulderBar.position.y = legHeight + torsoHeight * 0.87;
+  silhouette.add(shoulderBar);
+
+  const leftArm = new THREE.Mesh(
+    new THREE.PlaneGeometry(armWidth, armHeight),
+    silhouetteMaterial,
+  );
+  leftArm.position.set(-(shoulderWidth / 2 - armWidth / 2), legHeight + torsoHeight * 0.53, 0);
+  silhouette.add(leftArm);
+
+  const rightArm = new THREE.Mesh(
+    new THREE.PlaneGeometry(armWidth, armHeight),
+    silhouetteMaterial,
+  );
+  rightArm.position.set(shoulderWidth / 2 - armWidth / 2, legHeight + torsoHeight * 0.53, 0);
+  silhouette.add(rightArm);
+
+  return silhouette;
+}
 
 function formatResolution(width, height) {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
@@ -451,6 +529,50 @@ function formatCoverage(value) {
   return `${value.toFixed(1)}°`;
 }
 
+function updateViewerEyeHeight({ normalizeInput = false } = {}) {
+  const parsedEyeHeight = parsePositiveNumber(eyeHeightInput.value);
+  if (parsedEyeHeight !== null) {
+    viewerEyeHeightMeters = parsedEyeHeight;
+  }
+
+  camera.position.y = viewerEyeHeightMeters;
+  controls.target.set(0, viewerEyeHeightMeters, -1);
+  controls.update();
+
+  if (normalizeInput) {
+    eyeHeightInput.value = viewerEyeHeightMeters.toFixed(2);
+  }
+}
+
+function rebuildSilhouettes(radius, cylinderHeight) {
+  silhouettesGroup.clear();
+
+  if (silhouetteCount <= 0) {
+    return;
+  }
+
+  const usableRadius = radius * 0.72;
+  const innerRadius = Math.min(usableRadius * 0.52, Math.max(1.5, radius * 0.2));
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+
+  for (let index = 0; index < silhouetteCount; index += 1) {
+    const heightMeters = Math.min(
+      SILHOUETTE_HEIGHTS[index % SILHOUETTE_HEIGHTS.length],
+      cylinderHeight * 0.92,
+    );
+    const silhouette = createSilhouette(heightMeters);
+    const normalizedIndex = silhouetteCount === 1 ? 0.5 : (index + 0.5) / silhouetteCount;
+    const distance = innerRadius + (usableRadius - innerRadius) * Math.sqrt(normalizedIndex);
+    const angle = index * goldenAngle + Math.PI * 0.18;
+    const x = Math.cos(angle) * distance;
+    const z = Math.sin(angle) * distance;
+
+    silhouette.position.set(x, 0, z);
+    silhouette.lookAt(0, heightMeters * 0.52, 0);
+    silhouettesGroup.add(silhouette);
+  }
+}
+
 function parsePositiveNumber(value) {
   if (value.trim() === "") {
     return null;
@@ -532,6 +654,8 @@ function rebuildCylinder({ normalizeInputs = false } = {}) {
     new THREE.Vector3(-radius * 0.14, 0.008, radius * 0.74),
     new THREE.Vector3(radius * 0.14, 0.008, radius * 0.74),
   ]);
+
+  rebuildSilhouettes(radius, heightMeters);
 }
 
 function syncCylinderInputs({ normalize = false } = {}) {
@@ -547,6 +671,19 @@ function syncCylinderInputs({ normalize = false } = {}) {
   }
 
   rebuildCylinder({ normalizeInputs: normalize });
+}
+
+function syncSilhouetteCount({ normalize = false } = {}) {
+  const parsedCount = Number.parseInt(silhouetteCountInput.value, 10);
+  if (Number.isFinite(parsedCount)) {
+    silhouetteCount = THREE.MathUtils.clamp(parsedCount, 0, 40);
+  }
+
+  if (normalize) {
+    silhouetteCountInput.value = String(silhouetteCount);
+  }
+
+  rebuildCylinder();
 }
 
 function stopActiveStream() {
@@ -891,17 +1028,35 @@ diameterInput.addEventListener("input", () => {
 heightInput.addEventListener("input", () => {
   syncCylinderInputs();
 });
+eyeHeightInput.addEventListener("input", () => {
+  updateViewerEyeHeight();
+});
+silhouetteCountInput.addEventListener("input", () => {
+  syncSilhouetteCount();
+});
 diameterInput.addEventListener("change", () => {
   syncCylinderInputs({ normalize: true });
 });
 heightInput.addEventListener("change", () => {
   syncCylinderInputs({ normalize: true });
 });
+eyeHeightInput.addEventListener("change", () => {
+  updateViewerEyeHeight({ normalizeInput: true });
+});
+silhouetteCountInput.addEventListener("change", () => {
+  syncSilhouetteCount({ normalize: true });
+});
 diameterInput.addEventListener("blur", () => {
   syncCylinderInputs({ normalize: true });
 });
 heightInput.addEventListener("blur", () => {
   syncCylinderInputs({ normalize: true });
+});
+eyeHeightInput.addEventListener("blur", () => {
+  updateViewerEyeHeight({ normalizeInput: true });
+});
+silhouetteCountInput.addEventListener("blur", () => {
+  syncSilhouetteCount({ normalize: true });
 });
 window.addEventListener("keydown", (event) => {
   const target = event.target;
@@ -926,6 +1081,8 @@ window.addEventListener("resize", () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
+updateViewerEyeHeight({ normalizeInput: true });
+syncSilhouetteCount({ normalize: true });
 syncCylinderInputs({ normalize: true });
 syncSourceFields();
 renderProtocolTargetOptions(sourceModeSelect.value);
